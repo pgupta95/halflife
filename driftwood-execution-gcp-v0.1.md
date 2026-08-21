@@ -8,25 +8,47 @@
 
 ## 1. Stack delta
 
+A full 10-model sweep is **110 MB on disk** — 77 MB of that is embeddings. This
+is a single-user benchmark that runs on one laptop and produces less data than a
+phone camera roll. The infrastructure is sized accordingly.
+
 | Layer | v0.2 spec | This build | Why |
 |---|---|---|---|
-| Language | TypeScript (Node 22), pnpm + Turborepo | **unchanged** | |
-| Database | Neon/Supabase Postgres 16 + pgvector | **Cloud SQL for Postgres 16 + pgvector** in `us-central1`, reached via Cloud SQL Auth Proxy on the Mac | "Data in GCP." pgvector is a supported extension. Single zonal instance, no HA — this is a benchmark, not a service |
-| Blob storage | *(none)* | **GCS bucket** `gs://<proj>-driftwood-raw` — raw provider responses as per-run JSONL, plus nightly `pg_dump` | Keeps `raw_response` JSONB from bloating a small instance; gives a re-derivable archive if the DB is ever rebuilt |
-| Durable execution | Inngest v1 → Temporal | **`graphile-worker`** (Postgres-backed queue, in-process on the Mac) | Inngest needs a public webhook URL to drive a laptop. A Postgres queue gives retries, backoff, and per-queue concurrency caps with zero extra infra, and the state lives in the same DB as the results. `UNIQUE (run_id, gen_index)` already makes every step idempotent — that's the hard part, and the spec already solved it |
-| LLM gateway | OpenRouter / LiteLLM | **Vertex AI**, behind our own thin `ModelGateway` interface | See §2 — the gateway is not optional here, because Vertex speaks three different request shapes |
-| Embeddings | *(unspecified, VECTOR(1536))* | **Vertex `gemini-embedding-001`, `output_dimensionality: 1536`** | Matroyshka truncation to exactly 1536 means the spec's `VECTOR(1536)` column needs no change |
-| Search-grounded resolver | "search-grounded model call" | **Gemini on Vertex with Google Search grounding** | Native on Vertex, and cheaper than Claude's server-side web search. Note: Claude-on-Vertex only offers the basic `web_search_20250305` variant, and no web *fetch* at all |
-| LLM tracing | Langfuse self-hosted | **deferred.** `raw_response` in Postgres + JSONL in GCS | Another container to babysit on a laptop for observability we can get from the DB in week 1. Revisit if debugging gets painful |
-| Cache | Upstash Redis | **deferred.** `known_quantities` table + in-process LRU | The only hot cache we need is referent resolution, which must be durable anyway — so it belongs in Postgres, not Redis |
-| Survival stats | `lifelines` Python sidecar | **unchanged** — FastAPI on `127.0.0.1`, `uv`-managed | |
-| API / Frontend | Fastify / Next.js 15 on Vercel | **unchanged code, runs locally.** Cloud Run is the documented later path | |
-| Slack | Bolt HTTP mode | **deferred to week 6.** Needs a public URL → Cloud Run then, not the Mac | |
-| Secrets | *(unspecified)* | **GCP Secret Manager**, ADC for Vertex (`gcloud auth application-default login`) | No API keys on disk; Vertex auth is ADC-based by design |
+| Language | TypeScript (Node 22), pnpm + Turborepo | **pnpm workspaces, no Turborepo** | Turbo's remote caching earns its keep in CI across a team. One developer, one machine, seven packages — `pnpm -r` is enough |
+| Database | Neon/Supabase Postgres 16 + pgvector | **Local Postgres 16 + pgvector in Docker** (`pgvector/pgvector:pg16`) | Same engine, same extension, same migrations. Free, and no network round trip on the per-generation query the ChainRunner runs 12,500 times. Lifts to Cloud SQL with `pg_dump`/`pg_restore` when week 6 needs it |
+| Backups | *(none)* | **GCS bucket, versioned.** `pg_dump` after each sweep | The chains are the irreplaceable artifact — re-running costs money *and* returns different data, because the models underneath have moved. 110 MB is ~$0.002/month. This is the "data in GCP" requirement, satisfied for a fifth of a cent |
+| Durable execution | Inngest v1 → Temporal | **`graphile-worker`** | Needs no public webhook URL to drive a laptop, and `UNIQUE (run_id, gen_index)` already makes every step idempotent |
+| LLM gateway | OpenRouter / LiteLLM | **Vertex AI** behind a thin `ModelGateway` | The one genuinely cloud dependency. ADC auth, no infra to create |
+| Embeddings | *(VECTOR(1536))* | **Vertex `gemini-embedding-001`, `output_dimensionality: 1536`** | Matches the spec's column exactly |
+| Search-grounded resolver | "search-grounded model call" | **Gemini + Google Search grounding** | Native on Vertex; the only model spend in the evaluator (§4.1) |
+| Survival stats | `lifelines` Python sidecar | **Kaplan-Meier in SQL** | The spec offers both. At 250 chains, KM with Greenwood CIs is ~40 lines of SQL against a table we already have — versus adding Python, `uv`, FastAPI, and a second process to the stack. Revisit if we need competing-risks models |
+| API / Frontend | Fastify / Next.js 15 on Vercel | **unchanged code, runs locally** | |
+| Cache | Upstash Redis | **dropped** | The only hot cache is referent resolution, which must be durable — so it is a Postgres table, not Redis |
+| LLM tracing | Langfuse self-hosted | **dropped** | `raw_response` is already in Postgres |
+| Secrets | *(unspecified)* | **`.env`, until week 6** | Vertex uses ADC. Local Postgres has a local password. There are no secrets until Slack tokens arrive |
+| Service accounts / IAM | *(unspecified)* | **none, until week 6** | ADC with your user credentials covers Vertex. A service account is for unattended cloud compute, which does not exist yet |
+| Hosting | Vercel + Fly.io | **the Mac** | |
+| Slack | Bolt HTTP mode | **week 6** | Genuinely needs always-on and a public URL — see below |
 
-**Nothing in the v0.2 schema needs to change to run on Cloud SQL.** It is stock Postgres 16 + pgvector + pgcrypto. The migration files transfer as written.
+**Nothing in the v0.2 schema changes.** Stock Postgres 16 + pgvector + pgcrypto,
+identical locally and on Cloud SQL.
 
----
+### What the whole stack is
+
+```
+Node 22 + pnpm          one repo
+Docker                  one container: postgres:16 + pgvector
+Vertex AI               ADC, no infra
+GCS                     one bucket, ~$0.002/mo
+```
+
+### When cloud infra becomes necessary
+
+Exactly one trigger: **Slack needs a public HTTPS endpoint and an always-on cron**,
+so week 6 lifts the API to Cloud Run and the database to Cloud SQL. That is also
+the point where the project has proven itself worth ~$25/month. Until then,
+paying $38 in Cloud SQL charges across the build to hold the results of a $42
+sweep is the wrong shape.
 
 ## 2. The Vertex gateway
 
@@ -237,8 +259,8 @@ same attractor entities and share one cache.
 | 10 models — full roster | ~$18 | ~$24 | **~$42** |
 | 10 models, re-sweep on a warm cache | ~$18 | ~$3 | **~$21** |
 
-Standing infrastructure: **~$8–25/mo** (Cloud SQL `db-f1-micro` to `db-g1-small`
-+ GCS). At this point the database costs more than the models.
+Standing infrastructure: **~$0.002/mo** — one GCS bucket holding 110 MB of
+backups. Postgres is a local Docker container; compute is the Mac.
 
 **Confidence.** Mutate arithmetic is solid. The Flash-tier and grounding rates
 should be confirmed against the live pricing page — see §4.6. The unique-entity
@@ -265,13 +287,14 @@ halflife/
 ├── packages/
 │   ├── db/             Drizzle schema + migrations (v0.2 SQL, verbatim + §3 fixes)
 │   ├── gateway/        ModelGateway — Vertex Gemini / Claude / MaaS adapters
-│   ├── eval/           referent resolver, dimensional check, triple extraction, drift
+│   ├── eval/           referent resolver, dimensional check, drift, Kaplan-Meier SQL
 │   └── shared/         zod schemas, types
-├── services/
-│   └── stats/          Python + lifelines, FastAPI on 127.0.0.1
 └── infra/
-    ├── bootstrap-gcp.sh
+    ├── bootstrap-gcp.sh    enable 2 APIs, create 1 bucket
+    ├── preflight.sh        read-only project/roster check
     └── README.md
+
+docker-compose.yml          the entire data tier
 ```
 
 ---
@@ -280,12 +303,12 @@ halflife/
 
 Weeks 1–6 track the spec's §9. Changes are marked ▲.
 
-1. **Week 1 — foundation.** ▲ GCP bootstrap (project, Cloud SQL, GCS, Secret Manager, Vertex enablement). Schema + migrations including the §3 fixes. `ModelGateway` with all three Vertex adapters behind one Zod-enforced interface. ▲ Enable and smoke-test every roster model — this is where Model Garden enablement and quota requests surface. Run one chain by hand at depth 5 and read the output.
+1. **Week 1 — foundation.** ▲ `docker compose up`, GCS bucket, Vertex enablement — that is the whole bootstrap. Schema + migrations including the §3 fixes. `ModelGateway` with all three Vertex adapters behind one Zod-enforced interface. ▲ Enable and smoke-test every roster model — this is where Model Garden enablement and quota requests surface. Run one chain by hand at depth 5 and read the output.
 2. **Week 2 — the long pole.** Referent resolver: `known_quantities` (with §3.6 normalisation), Wikidata SPARQL, Gemini-grounded fallback with write-back. Budget three weeks, per the spec.
 3. **Week 3 — measurement.** Dimensional + structural checks, death detector (with §3.3 locked), ChainRunner on `graphile-worker` with per-model concurrency caps. ▲ **Pilot sweep** (2×3×2). Hand-label 50 chains, calibrate, run the seed-sufficiency test. Full sweep only once thresholds are fit.
-4. **Week 4 — serving.** Stats sidecar, leaderboard MV, public read API, dashboard with drift chart + KM curves.
+4. **Week 4 — serving.** ▲ Kaplan-Meier in SQL, leaderboard MV, public read API, dashboard with drift chart + KM curves.
 5. **Week 5 — Track 2 prep.** ▲ Lazy static answerer, math verification gate, human approval queue.
-6. **Week 6 — the drip.** ▲ Deploy API to Cloud Run (Slack needs a public URL). Slack app, seasons, cron drip, Block Kit.
+6. **Week 6 — the drip.** ▲ **The one week that needs cloud infra.** Lift Postgres to Cloud SQL (`pg_dump`/`pg_restore`) and the API to Cloud Run, because Slack needs a public HTTPS endpoint and an always-on cron. Add the service account and Secret Manager here, where they first earn their place. Slack app, seasons, cron drip, Block Kit.
 
 ---
 

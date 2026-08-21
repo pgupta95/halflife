@@ -76,7 +76,9 @@ Unlike the mutate calls, answers all go to one static answerer, so there is no
 spread across tiers to soften it — this single line is larger than the rest of
 the sweep combined.
 
-**Recommendation.** Generate answers on demand — when a question is queued into a season, and on re-roll. The `answers` table already models this correctly (one-to-many off `questions`, `attempt` column); only the trigger needs to move. Cuts total sweep cost by roughly 70%.
+**Recommendation.** Generate answers on demand — when a question is queued into a season, and on re-roll. The `answers` table already models this correctly (one-to-many off `questions`, `attempt` column); only the trigger needs to move. Cuts total sweep cost by roughly 80%, and is the
+largest single saving available anywhere in the build. §4.3 covers whether the
+remaining one-per-day answer should come from the API or a Pro subscription.
 
 ### 3.3 Death generation is ambiguous under two-generation persistence
 
@@ -114,51 +116,124 @@ The seed is `gen_index = 0`, and `drift_from_seed` is measured against it. Nothi
 
 ## 4. Cost model for the first sweep
 
-5 seeds × 10 models × 5 replicates × 50 generations = 12,500 mutate calls.
+5 seeds × 10 models × 5 replicates × 50 generations = 12,500 mutate calls,
+spread across 10 models = **1,250 calls per model**. Most of the roster is
+Flash/Haiku/MaaS tier, so pricing the sweep at frontier rates overstates it
+several-fold.
 
-The number that matters and is easy to get wrong: 12,500 calls spread across
-**10 models is 1,250 calls per model**, and most of the roster is Flash/Haiku/MaaS
-tier. Pricing the whole sweep at frontier rates overstates it by roughly 5×.
+### 4.1 Mutate calls
 
-Per call: ~700 input tokens (5-question window + template + output schema),
-~250 output (the question, `named_quantities`, and — on the Claude and Gemini
-models — billed thinking tokens). So 0.875 Mtok in / 0.31 Mtok out per model.
-
-| Model | $/Mtok in / out | Mutate cost |
+| Scenario | in / out tokens | Sweep cost |
 |---|---|---|
-| Claude Opus 5 | 5.00 / 25.00 | $12.19 |
-| Claude Sonnet 5 | 3.00 / 15.00 | $7.31 |
-| Claude Haiku 4.5 | 1.00 / 5.00 | $2.44 |
-| Gemini Pro tier | ~1.25 / ~10.00 | $4.22 |
-| Gemini Flash tier | ~0.30 / ~2.50 | $1.04 |
-| MaaS open-weight × 5 | ~0.30 / ~1.00 | $2.88 |
-| **Mutate total** | | **~$30** |
+| Generous (5-question window, verbose template) | 700 / 250 | $30.07 |
+| **Target: terse template, thinking off** | **400 / 150** | **$17.74** |
+| Target template, thinking left on | 400 / 500 | $45.09 |
+| Floor (200 words in / 30 words out) | 270 / 40 | $7.19 |
 
-| Other lines | Estimate | Notes |
+**400 in / 150 out is the number to design for.** The floor is not reachable
+because two things get billed that are not prose: the output schema counts as
+input (~100 tokens), and `named_quantities` — three entries of `{label, value,
+unit}` — is most of the output JSON, not the 30-word question.
+
+**Thinking tokens are the real variable, and they are invisible.** Claude Opus 5
+runs adaptive thinking by default; Gemini's thinking budget is on by default.
+Thinking bills as output, and leaving it on roughly triples the output line
+($17.74 → $45.09). Disable it wherever the provider allows:
+
+- Gemini Flash tier: `thinkingConfig: {thinkingBudget: 0}`
+- Claude: `thinking: {type: "disabled"}` is accepted at effort `high` or below.
+  The documented failure mode (tool calls leaking into visible text) is specific
+  to tool use; we use structured output, so the exposure is lower — but verify on
+  the pilot before trusting it across a sweep.
+- Gemini Pro tier: cannot be fully disabled on all versions.
+- MaaS open-weight: mostly no thinking to disable.
+
+This is a §3.1 decision as much as a cost one. A thinking model and a
+non-thinking model are not performing the same task when asked to mutate a
+question, so disabling it where possible makes the comparison *more* honest, not
+just cheaper — and where it cannot be disabled, that goes in `reasoning_config`
+and gets published as a confound.
+
+**Prompt caching does not apply here.** The stable prefix (template + schema) is
+~250 tokens, below the ~1024-token minimum cacheable prefix. So shrinking the
+prompt carries no hidden cache penalty — it is a straight win.
+
+**Watch for question growth.** These estimates assume ~25-word questions. Degrading
+questions tend to get *longer* — more qualifiers, more invented entities — so a
+5-question window at generation 45 may be several times a window at generation 5.
+The schema already records `prompt_tokens` / `completion_tokens` per generation;
+the pilot gives the real curve, and the estimate should be refit against it rather
+than trusted.
+
+### 4.2 Evaluator — now the dominant line
+
+**This is the cost centre, not mutation.** Referent resolution falls through
+`known_quantities` (free) → Wikidata SPARQL (free) → grounded search
+(~$35 per 1,000 requests). At ~3 referents per question, a sweep raises 37,500
+referent instances, and everything depends on how many collapse to the same cache key:
+
+| Cache behaviour | Grounded calls | Cost |
 |---|---|---|
-| Referent resolution | **$20 – $140** | Now the *dominant* line. Google Search grounding runs ~$35/1k grounded requests. ~37,500 referent lookups, but `known_quantities` + Wikidata SPARQL (free) should absorb most — only the residue reaches a grounded call. The 7× spread is entirely the cache hit rate, which is why §3.6 matters |
-| Embeddings | **< $1** | 12.5k × ~50 tokens on `gemini-embedding-001` |
-| Answers (lazy, per §3.2) | **~$1** | |
-| *Answers (eager, as drawn)* | *$212* | *The single largest line in the spec's pipeline, and all of it discarded — see §3.2* |
-| **First sweep total** | **~$50 – $175** | Most likely near $80 |
-| Cloud SQL + GCS, standing | **~$25 – 40/mo** | `db-g1-small`. `db-f1-micro` (~$8/mo) is probably enough for this workload — worth trying first |
+| Good — normalised keys, §3.6 applied (3% unique) | 675 | **$23.63** |
+| Poor — raw `entity_label` matching (25% unique) | 5,625 | **$196.88** |
 
-**Confidence.** The Claude line is solid (published per-token rates; note Vertex
-partner pricing differs from first-party and should be confirmed). The Gemini and
-MaaS per-token numbers are the shakiest input here — check them against the Vertex
-pricing page before committing, since together they are a third of the mutate cost.
-The referent-resolution range is wide because it depends on a cache hit rate we
-cannot know until the resolver runs against real chains.
+**The §3.6 normalisation fix is worth ~$170 per sweep** — more than every other
+line combined. It is the single highest-leverage optimisation left, and it is a
+schema change plus a normalisation function, not a research problem.
 
-`runs.config` gets a `max_cost_usd` cap enforced per batch as risk §11 requires;
-the worker halts the batch on breach.
+**If you cap the resolver budget, do not let a skipped lookup count as a
+fabrication.** A cost-capped lookup that gets recorded as `fabricated` kills the
+chain early and corrupts the death generation — exactly the failure risk §11
+warns about. Needs a third state (`resolution_deferred`) that is excluded from
+the `groundedness` denominator rather than counted against it.
 
-**On phasing.** At ~$80 a sweep, cost is not a reason to pilot first. The reasons
-that survive are: the death thresholds are explicitly guesses until 50 chains are
-hand-labelled, and re-running against a corrected threshold wastes days more than
-dollars; and a pilot surfaces the Vertex per-model quota walls before they can
-strand a full sweep halfway through. A pilot of 2 seeds × 3 models × 2 replicates
-(~600 calls, ~$2) buys both. Worth doing on those grounds, not on budget grounds.
+### 4.3 Answers, embeddings, standing cost
+
+| Line | Cost | Notes |
+|---|---|---|
+| Answers — eager, all 12,500 | *$212.50* | *As the v0.2 pipeline is drawn. All discarded — see §3.2* |
+| **Answers — lazy, 1/day via API** | **$6.21/yr** | Track 2 consumes one question per day |
+| Answers — lazy, via Pro subscription | $0 | Saves $6.21/yr; costs the automation — see below |
+| Embeddings | < $1 | 12.5k × ~50 tokens, `gemini-embedding-001` |
+| Cloud SQL + GCS, standing | ~$25–40/mo | `db-g1-small`; try `db-f1-micro` (~$8/mo) first |
+
+**On using a Pro subscription for the daily answer.** The saving is $6.21/year.
+Against that: `daily_drops.answer_id` must be populated for the cron to fire, so a
+subscription puts a human paste step on the daily critical path, and there is no
+`raw_response`, no token counts, and no pinned model version behind it. Since
+answers sit outside the leaderboard and already pass a human approval gate, that
+loss of provenance is acceptable — but the automation loss is not worth $6.
+**Recommendation: API for the scheduled drip; subscription as the manual path for
+re-rolls while iterating on answer quality by hand.**
+
+### 4.4 Revised total
+
+| | Per sweep |
+|---|---|
+| Mutate (thinking off) | $17.74 |
+| Evaluator (good cache) | $23.63 |
+| Embeddings | ~$1 |
+| Answers (lazy) | ~$0 |
+| **Total** | **~$43** |
+
+Evaluator cache behaviour is the whole ballgame: at a poor hit rate the same
+sweep is ~$215.
+
+`runs.config` carries `max_cost_usd`, enforced per batch per risk §11; the worker
+halts the batch on breach.
+
+**Confidence.** Claude per-token rates are published and solid (Vertex partner
+pricing differs from first-party — confirm). The Gemini and MaaS rates and the
+$35/1k grounding rate are the shakiest inputs and are worth checking against the
+Vertex pricing page. The cache hit rate is unknowable until the resolver runs on
+real chains, which is the strongest argument for the pilot.
+
+**On phasing.** At ~$43 a sweep, cost is not a reason to pilot first. What survives:
+death thresholds are guesses until 50 chains are hand-labelled and re-running
+against a corrected threshold wastes days; the resolver cache hit rate — the one
+input that swings the total 5× — can only be measured on real chains; and a pilot
+surfaces Vertex per-model quota walls before they strand a full sweep. A pilot of
+2 seeds × 3 models × 2 replicates (~600 calls, well under $5) buys all three.
 
 ## 5. Repo layout
 

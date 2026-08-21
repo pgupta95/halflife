@@ -1,0 +1,20 @@
+{
+  "name": "halflife",
+  "version": "0.1.0",
+  "description": "Driftwood: Semantic Drift Observability Platform",
+  "private": true,
+  "scripts": {
+    "db:migrate": "pnpm --filter @halflife/db migrate",
+    "db:generate": "pnpm --filter @halflife/db generate",
+    "backup": "pnpm --filter @halflife/db backup",
+    "sweep": "pnpm --filter @halflife/worker sweep",
+    "dev:api": "pnpm --filter @halflife/api dev",
+    "dev:web": "pnpm --filter @halflife/web dev",
+    "dev:worker": "pnpm --filter @halflife/worker dev"
+  },
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@9.15.4"
+}

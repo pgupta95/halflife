@@ -1,0 +1,1 @@
+ALTER TYPE "public"."death_cause" ADD VALUE 'attractor_state';

@@ -15,6 +15,13 @@
       "when": 1787331504731,
       "tag": "0001_bitter_killer_shrike",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1787332890353,
+      "tag": "0002_fast_wallow",
+      "breakpoints": true
     }
   ]
 }

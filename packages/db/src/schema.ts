@@ -10,7 +10,9 @@ export const deathCause = pgEnum('death_cause', [
   'structure_lost',
   'degenerate_loop',
   'format_failure',
-  'attractor_state'
+  'attractor_state',        // deprecated: embedding-based, replaced by template_lock
+  'template_lock',          // deterministic: relation or template dominance
+  'dimension_collapse'      // deterministic: dimension entropy < 0.8 bits
 ]);
 
 // Models catalog
@@ -98,6 +100,8 @@ export const questions = pgTable('questions', {
   completionTokens: integer('completion_tokens'),
   latencyMs: integer('latency_ms'),
   costUsd: numeric('cost_usd', { precision: 10, scale: 6 }),
+  relationNormalized: text('relation_normalized'),        // 'fill', 'stack_to_reach', 'charge', etc
+  templateSignature: text('template_signature'),          // md5(dimension_a || relation_normalized || dimension_b)
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
 }, (table) => ({
   runGenIdx: uniqueIndex('questions_run_gen_idx').on(table.runId, table.genIndex)
@@ -129,6 +133,11 @@ export const questionEvaluations = pgTable('question_evaluations', {
   // Descriptive (not death triggers)
   driftFromSeed: numeric('drift_from_seed', { precision: 5, scale: 4 }), // §3.4 - 1 - cosine_similarity
   driftFromParent: numeric('drift_from_parent', { precision: 5, scale: 4 }),
+
+  // Round 2 deterministic detectors
+  relationRepeat6: integer('relation_repeat_6'),           // count of matching relation in last 6
+  templateShare10: numeric('template_share_10', { precision: 3, scale: 2 }), // dominant signature share in last 10
+  dimensionEntropy10: numeric('dimension_entropy_10', { precision: 4, scale: 3 }), // Shannon bits over last 10
 
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
 }, (table) => ({

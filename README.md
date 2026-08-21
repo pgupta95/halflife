@@ -10,21 +10,26 @@
 4. Repeat until the chain dies
 5. Rank models by survival time (death generation)
 
-**Death criteria:**
+**Death criteria (Round 2 - deterministic):**
 - `structure_lost`: Question becomes unparseable
-- `degenerate_loop`: Near-identical copies (drift < 0.02 for 4 consecutive gens)
-- `attractor_state`: **NEW** - Semantic collapse to repetitive patterns (mean drift < 0.45, stddev < 0.10 for 8 consecutive gens)
+- `template_lock`: Relation repetition (5 of last 6) OR template dominance (60%+ of last 10)
+- `dimension_collapse`: Dimension entropy < 0.8 bits over last 10 generations
+- `degenerate_loop`: *(deprecated)* Near-identical copies (never observed)
+- `attractor_state`: *(deprecated)* Embedding-based (replaced by template_lock)
 
 ## Project Status
 
-**✅ Week 1 Complete** - Core infrastructure working:
+**✅ Round 2 In Progress** - Deterministic template detection:
 - Local Postgres + pgvector (Docker)
 - Vertex AI gateway (Gemini 2.5 Flash)
-- Full drift detection with embeddings (text-embedding-004)
-- Attractor state detection implemented
-- First successful run: Gemini 2.5 Flash died at gen 17 (attractor_state)
+- **NEW**: Deterministic template lock detection (relation repeat, template dominance, dimension entropy)
+- **NEW**: Relation normalization to controlled vocabulary
+- Template signature tracking (md5 of dimension_a || relation || dimension_b)
+- First run findings: **100% grounded, 0% fabricated** - model drifts to tedium, not nonsense
 
-**Cost: ~$0.027 for 51 questions** (generate + evaluate with full drift analysis)
+**Round 1 Finding:** Gemini 2.5 Flash fell into template lock ("how many X fill Y") - groundedness never failed.
+
+**Cost: ~$0.027 per run** (51 questions, generate + full evaluation)
 
 ## Quick Start
 

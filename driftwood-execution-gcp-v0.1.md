@@ -11,7 +11,7 @@
 | Layer | v0.2 spec | This build | Why |
 |---|---|---|---|
 | Language | TypeScript (Node 22), pnpm + Turborepo | **unchanged** | |
-| Database | Neon/Supabase Postgres 16 + pgvector | **Cloud SQL for Postgres 16 + pgvector**, reached via Cloud SQL Auth Proxy on the Mac | "Data in GCP." pgvector is a supported extension. Single zonal instance, no HA — this is a benchmark, not a service |
+| Database | Neon/Supabase Postgres 16 + pgvector | **Cloud SQL for Postgres 16 + pgvector** in `us-central1`, reached via Cloud SQL Auth Proxy on the Mac | "Data in GCP." pgvector is a supported extension. Single zonal instance, no HA — this is a benchmark, not a service |
 | Blob storage | *(none)* | **GCS bucket** `gs://<proj>-driftwood-raw` — raw provider responses as per-run JSONL, plus nightly `pg_dump` | Keeps `raw_response` JSONB from bloating a small instance; gives a re-derivable archive if the DB is ever rebuilt |
 | Durable execution | Inngest v1 → Temporal | **`graphile-worker`** (Postgres-backed queue, in-process on the Mac) | Inngest needs a public webhook URL to drive a laptop. A Postgres queue gives retries, backoff, and per-queue concurrency caps with zero extra infra, and the state lives in the same DB as the results. `UNIQUE (run_id, gen_index)` already makes every step idempotent — that's the hard part, and the spec already solved it |
 | LLM gateway | OpenRouter / LiteLLM | **Vertex AI**, behind our own thin `ModelGateway` interface | See §2 — the gateway is not optional here, because Vertex speaks three different request shapes |
@@ -114,126 +114,145 @@ The seed is `gen_index = 0`, and `drift_from_seed` is measured against it. Nothi
 
 ---
 
-## 4. Cost model for the first sweep
+### 3.8 Evaluation is not on the critical path — batch it
 
-5 seeds × 10 models × 5 replicates × 50 generations = 12,500 mutate calls,
-spread across 10 models = **1,250 calls per model**. Most of the roster is
-Flash/Haiku/MaaS tier, so pricing the sweep at frontier rates overstates it
-several-fold.
+The v0.2 sequence diagram runs the evaluator inline, one generation at a time,
+with the death detector feeding back into the ChainRunner. But §5 locks **"keep
+running past death — continue to `max_generations` and persist everything."**
 
-### 4.1 Mutate calls
+If the chain never terminates early, the chain never needs the evaluation. Nothing
+in the mutate loop reads a `question_evaluation`. The feedback edge in the diagram
+carries no decision.
 
-| Scenario | in / out tokens | Sweep cost |
+**Recommendation.** Split the pipeline in two:
+
+1. **ChainRunner** — synchronous, generation by generation, because gen N needs
+   gens N-5..N-1. Writes `questions` only. Per-model concurrency caps.
+2. **Evaluator** — a separate job over completed runs. Resolves referents,
+   runs the dimensional and structural checks, embeds, scores drift, fires death
+   events retrospectively.
+
+Three things fall out: the evaluator becomes trivially parallel and restartable
+independent of the chains; re-running a new `evaluator_version` over stored chains
+costs no model calls at all, which is exactly what calibration needs; and the
+evaluator's own model calls become batchable (see §4.4).
+
+The one check that must stay inline is `format_failure` — two consecutive
+structured-output parse failures. That needs no model call, just a failed parse.
+
+---
+
+## 4. Cost model
+
+### 4.1 What actually needs a model call
+
+Auditing this against the spec, the evaluator is **already almost entirely
+deterministic** — the §2 decision to make the death axis "objective and countable"
+did most of this work already. Only one line is a model call:
+
+| Evaluator step | Mechanism | Cost |
 |---|---|---|
-| Generous (5-question window, verbose template) | 700 / 250 | $30.07 |
-| **Target: terse template, thinking off** | **400 / 150** | **$17.74** |
-| Target template, thinking left on | 400 / 500 | $45.09 |
-| Floor (200 words in / 30 words out) | 270 / 40 | $7.19 |
+| Axis 2 — dimensional well-formedness | `js-quantities` dimensional analysis | **$0** — pure math |
+| Axis 3 — structural preservation | **Comes free with the mutate call.** The mutate response is already structured output carrying `named_quantities`; extend the schema to return `{quantity_a, relation, quantity_b}` and the triple arrives with the question. A failure to produce it *is* the structure-lost signal | **$0** — no separate call |
+| Drift from seed / parent | Cosine over stored embeddings | **~$0** — embeddings are ~$0.01/sweep |
+| Degenerate-loop detection | Threshold over drift series | **$0** — pure math |
+| Death rule | Boolean logic over the above | **$0** — pure math |
+| Answer verification (publish gate) | `mathjs` recompute + unit check | **$0** — pure math, and already spec'd this way |
+| Axis 1 — referent resolution | `known_quantities` → Wikidata SPARQL → **grounded search** | **the only model spend** |
 
-**400 in / 150 out is the number to design for.** The floor is not reachable
-because two things get billed that are not prose: the output schema counts as
-input (~100 tokens), and `named_quantities` — three entries of `{label, value,
-unit}` — is most of the output JSON, not the 30-word question.
+Axis 3 was costed as a separate extraction call in earlier drafts of this doc.
+It is not one. That was my error.
 
-**Thinking tokens are the real variable, and they are invisible.** Claude Opus 5
-runs adaptive thinking by default; Gemini's thinking budget is on by default.
-Thinking bills as output, and leaving it on roughly triples the output line
-($17.74 → $45.09). Disable it wherever the provider allows:
+So the entire evaluator reduces to a single question: *how often does a referent
+miss both the cache and Wikidata?*
 
-- Gemini Flash tier: `thinkingConfig: {thinkingBudget: 0}`
-- Claude: `thinking: {type: "disabled"}` is accepted at effort `high` or below.
-  The documented failure mode (tool calls leaking into visible text) is specific
-  to tool use; we use structured output, so the exposure is lower — but verify on
-  the pilot before trusting it across a sweep.
-- Gemini Pro tier: cannot be fully disabled on all versions.
-- MaaS open-weight: mostly no thinking to disable.
+### 4.2 One mid-shelf model, measured
 
-This is a §3.1 decision as much as a cost one. A thinking model and a
-non-thinking model are not performing the same task when asked to mutate a
-question, so disabling it where possible makes the comparison *more* honest, not
-just cheaper — and where it cannot be disabled, that goes in `reasoning_config`
-and gets published as a confound.
+Baseline: **one Gemini Flash-tier model** ($0.30 / $2.50 per Mtok), 5 seeds ×
+5 replicates × 50 generations = **1,250 mutate calls**, thinking disabled,
+400 in / 150 out.
 
-**Prompt caching does not apply here.** The stable prefix (template + schema) is
-~250 tokens, below the ~1024-token minimum cacheable prefix. So shrinking the
-prompt carries no hidden cache penalty — it is a straight win.
-
-**Watch for question growth.** These estimates assume ~25-word questions. Degrading
-questions tend to get *longer* — more qualifiers, more invented entities — so a
-5-question window at generation 45 may be several times a window at generation 5.
-The schema already records `prompt_tokens` / `completion_tokens` per generation;
-the pilot gives the real curve, and the estimate should be refit against it rather
-than trusted.
-
-### 4.2 Evaluator — now the dominant line
-
-**This is the cost centre, not mutation.** Referent resolution falls through
-`known_quantities` (free) → Wikidata SPARQL (free) → grounded search
-(~$35 per 1,000 requests). At ~3 referents per question, a sweep raises 37,500
-referent instances, and everything depends on how many collapse to the same cache key:
-
-| Cache behaviour | Grounded calls | Cost |
+| Line | Volume | Cost |
 |---|---|---|
-| Good — normalised keys, §3.6 applied (3% unique) | 675 | **$23.63** |
-| Poor — raw `entity_label` matching (25% unique) | 5,625 | **$196.88** |
+| Mutate input | 0.500 Mtok | $0.15 |
+| Mutate output | 0.188 Mtok | $0.47 |
+| **Mutate total** | 1,250 calls | **$0.62** |
+| Embeddings | 0.063 Mtok | $0.01 |
+| Dimensional / structural / drift / death | — | $0.00 |
+| Referent resolution | see below | $2.36 – $27.56 |
 
-**The §3.6 normalisation fix is worth ~$170 per sweep** — more than every other
-line combined. It is the single highest-leverage optimisation left, and it is a
-schema change plus a normalisation function, not a research problem.
+**Generating 1,250 question mutations costs 62 cents.** You were right that this
+should be cheap; it is. Every remaining dollar is referent resolution.
 
-**If you cap the resolver budget, do not let a skipped lookup count as a
-fabrication.** A cost-capped lookup that gets recorded as `fabricated` kills the
-chain early and corrupts the death generation — exactly the failure risk §11
-warns about. Needs a third state (`resolution_deferred`) that is excluded from
-the `groundedness` denominator rather than counted against it.
+### 4.3 The only real variable
 
-### 4.3 Answers, embeddings, standing cost
+3 referents × 1,250 questions = 3,750 lookups per sweep. Wikidata resolves perhaps
+40% of the uniques for free. Grounded search runs ~$35/1k. Everything hinges on
+what fraction of those 3,750 are *distinct entities after normalisation*:
 
-| Line | Cost | Notes |
-|---|---|---|
-| Answers — eager, all 12,500 | *$212.50* | *As the v0.2 pipeline is drawn. All discarded — see §3.2* |
-| **Answers — lazy, 1/day via API** | **$6.21/yr** | Track 2 consumes one question per day |
-| Answers — lazy, via Pro subscription | $0 | Saves $6.21/yr; costs the automation — see below |
-| Embeddings | < $1 | 12.5k × ~50 tokens, `gemini-embedding-001` |
-| Cloud SQL + GCS, standing | ~$25–40/mo | `db-g1-small`; try `db-f1-micro` (~$8/mo) first |
+| Unique-entity rate | Grounded calls | Cost | Sweep total |
+|---|---|---|---|
+| 3% | 68 | $2.36 | **$2.99** |
+| 5% | 112 | $3.94 | **$4.57** |
+| 10% (central) | 225 | $7.88 | **$8.50** |
+| 20% | 450 | $15.75 | **$16.38** |
+| 35% | 788 | $27.56 | **$28.19** |
 
-**On using a Pro subscription for the daily answer.** The saving is $6.21/year.
-Against that: `daily_drops.answer_id` must be populated for the cron to fire, so a
-subscription puts a human paste step on the daily critical path, and there is no
-`raw_response`, no token counts, and no pinned model version behind it. Since
-answers sit outside the leaderboard and already pass a human approval gate, that
-loss of provenance is acceptable — but the automation loss is not worth $6.
-**Recommendation: API for the scheduled drip; subscription as the manual path for
-re-rolls while iterating on answer quality by hand.**
+**This rate is the single number worth measuring, and nobody can predict it.**
+§10 predicts strong entity attractors (blue whales, Olympic pools,
+Hiroshima-equivalents), which pushes it low; drifting questions inventing novel
+constants pushes it high. Measuring it is the pilot's most valuable output —
+more than the drift curves.
 
-### 4.4 Revised total
+Two things move it, both cheap:
+- **§3.6 normalised cache keys.** Collapsing "Porsche Taycan battery capacity" /
+  "Taycan battery" / "battery of a Taycan" into one row is the difference between
+  the top and bottom of that table.
+- **Cache across sweeps, permanently.** `known_quantities` has no TTL and should
+  not get one. Sweep 2 pays only for entities sweep 1 never saw, so the marginal
+  cost of re-running a sweep trends toward the mutate line alone (~$0.62).
 
-| | Per sweep |
-|---|---|
-| Mutate (thinking off) | $17.74 |
-| Evaluator (good cache) | $23.63 |
-| Embeddings | ~$1 |
-| Answers (lazy) | ~$0 |
-| **Total** | **~$43** |
+### 4.4 Batching — not yet
 
-Evaluator cache behaviour is the whole ballgame: at a poor hit rate the same
-sweep is ~$215.
+Gemini Batch Prediction is ~50% off and, per §3.8, the evaluator is off the
+critical path so it is eligible. But at a $2–8 evaluator line, batching saves
+$1–4 and buys polling, job management, and partial-failure handling.
 
-`runs.config` carries `max_cost_usd`, enforced per batch per risk §11; the worker
-halts the batch on breach.
+**Verdict: skip it.** Revisit when the evaluator line clears ~$50/sweep — which
+means a 10-model roster *and* a unique-entity rate at the bad end of §4.3. Note it
+in the code as the intended escape hatch, don't build it.
 
-**Confidence.** Claude per-token rates are published and solid (Vertex partner
-pricing differs from first-party — confirm). The Gemini and MaaS rates and the
-$35/1k grounding rate are the shakiest inputs and are worth checking against the
-Vertex pricing page. The cache hit rate is unknowable until the resolver runs on
-real chains, which is the strongest argument for the pilot.
+Embeddings are also batchable at 50% off. That saves half a cent. No.
 
-**On phasing.** At ~$43 a sweep, cost is not a reason to pilot first. What survives:
-death thresholds are guesses until 50 chains are hand-labelled and re-running
-against a corrected threshold wastes days; the resolver cache hit rate — the one
-input that swings the total 5× — can only be measured on real chains; and a pilot
-surfaces Vertex per-model quota walls before they strand a full sweep. A pilot of
-2 seeds × 3 models × 2 replicates (~600 calls, well under $5) buys all three.
+### 4.5 Projection to the full roster
+
+Scaling the measured single-model baseline. Mutate scales linearly per model with
+tier; referent resolution scales **sub**-linearly, because models converge on the
+same attractor entities and share one cache.
+
+| Configuration | Mutate | Resolution | Total |
+|---|---|---|---|
+| 1 mid-shelf model (measured above) | $0.62 | ~$7.88 | **~$8.50** |
+| 3 models — pilot roster | ~$3 | ~$12 | **~$15** |
+| 10 models — full roster | ~$18 | ~$24 | **~$42** |
+| 10 models, re-sweep on a warm cache | ~$18 | ~$3 | **~$21** |
+
+Standing infrastructure: **~$8–25/mo** (Cloud SQL `db-f1-micro` to `db-g1-small`
++ GCS). At this point the database costs more than the models.
+
+**Confidence.** Mutate arithmetic is solid. The Flash-tier and grounding rates
+should be confirmed against the live pricing page — see §4.6. The unique-entity
+rate is a genuine unknown and the pilot exists largely to pin it.
+
+### 4.6 What is still unverified
+
+Three inputs in this model are from documentation rather than from your project,
+and all three are checkable in about ten minutes with `infra/preflight.sh`:
+
+1. **Exact model IDs available in the region.** The roster here is tier-based;
+   Vertex model IDs and their regional availability change.
+2. **Live per-token rates** for the Gemini tier and MaaS models.
+3. **Grounding price per request**, which drives the dominant line.
 
 ## 5. Repo layout
 

@@ -13,9 +13,14 @@ brew install node pnpm uv                    # uv manages the Python stats sidec
 
 ## One-time setup
 
+Project `halflife-506215`, region `us-central1` (cheapest US pricing tier that
+still carries the full Vertex model roster; `us-east1`/`us-west1` price the same
+but have narrower Model Garden coverage).
+
 ```bash
 gcloud auth login
-PROJECT_ID=<your-project> ./bootstrap-gcp.sh
+./preflight.sh 2>&1 | tee preflight.txt   # read-only, confirms the roster first
+./bootstrap-gcp.sh
 gcloud auth application-default login        # ADC — this is how Vertex authenticates
 ```
 

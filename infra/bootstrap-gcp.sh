@@ -8,11 +8,12 @@
 # confirmation before touching anything. Re-running is safe: every step is
 # idempotent and skips resources that already exist.
 #
-#   PROJECT_ID=my-proj ./infra/bootstrap-gcp.sh
+#   ./infra/bootstrap-gcp.sh                    # defaults to halflife-506215
+#   PROJECT_ID=other ./infra/bootstrap-gcp.sh
 
 set -euo pipefail
 
-PROJECT_ID="${PROJECT_ID:?set PROJECT_ID}"
+PROJECT_ID="${PROJECT_ID:-halflife-506215}"
 REGION="${REGION:-us-central1}"
 SQL_INSTANCE="${SQL_INSTANCE:-driftwood-pg}"
 SQL_TIER="${SQL_TIER:-db-g1-small}"

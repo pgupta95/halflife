@@ -1,0 +1,17 @@
+# The entire Driftwood data tier. 110 MB for a full 10-model sweep.
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: driftwood
+      POSTGRES_PASSWORD: driftwood
+      POSTGRES_DB: driftwood
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U driftwood"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  pgdata:

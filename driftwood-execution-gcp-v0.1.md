@@ -67,13 +67,16 @@ The same applies to reasoning: Claude Opus 5 runs adaptive thinking *by default*
 
 This is honest and it is still a publishable benchmark. Claiming a fixed temperature we did not fix would not be.
 
-### 3.2 Answers should be lazy — **~$280 per sweep, for nothing**
+### 3.2 Answers should be lazy — **~$212 per sweep, for nothing**
 
 The pipeline as drawn generates an answer for every question (`PG --> ANS` for all 12,500). But §2 locks "grading target = the generated question only," and answers never touch the leaderboard. They exist for Track 2, which consumes **one question per day**.
 
-Answering all 12,500 at Opus-tier rates costs roughly $280/sweep and is thrown away.
+Answering all 12,500 at Opus-tier rates costs roughly $212/sweep and is thrown away.
+Unlike the mutate calls, answers all go to one static answerer, so there is no
+spread across tiers to soften it — this single line is larger than the rest of
+the sweep combined.
 
-**Recommendation.** Generate answers on demand — when a question is queued into a season, and on re-roll. The `answers` table already models this correctly (one-to-many off `questions`, `attempt` column); only the trigger needs to move. Cuts sweep cost by roughly half.
+**Recommendation.** Generate answers on demand — when a question is queued into a season, and on re-roll. The `answers` table already models this correctly (one-to-many off `questions`, `attempt` column); only the trigger needs to move. Cuts total sweep cost by roughly 70%.
 
 ### 3.3 Death generation is ambiguous under two-generation persistence
 
@@ -113,20 +116,49 @@ The seed is `gen_index = 0`, and `drift_from_seed` is measured against it. Nothi
 
 5 seeds × 10 models × 5 replicates × 50 generations = 12,500 mutate calls.
 
-| Line | Estimate | Notes |
+The number that matters and is easy to get wrong: 12,500 calls spread across
+**10 models is 1,250 calls per model**, and most of the roster is Flash/Haiku/MaaS
+tier. Pricing the whole sweep at frontier rates overstates it by roughly 5×.
+
+Per call: ~700 input tokens (5-question window + template + output schema),
+~250 output (the question, `named_quantities`, and — on the Claude and Gemini
+models — billed thinking tokens). So 0.875 Mtok in / 0.31 Mtok out per model.
+
+| Model | $/Mtok in / out | Mutate cost |
 |---|---|---|
-| Mutate calls | **$150 – $400** | ~800 in / ~200 out per call. Wide because it depends entirely on the roster's tier mix — an all-frontier roster lands at the top, a roster with Flash/Haiku-tier models at the bottom |
-| Referent resolution | **$30 – $250** | Dominated by Google Search grounding (~$35/1k grounded requests). The 8× spread *is* the `known_quantities` cache hit rate. Fix §3.6 and this is the small number |
-| Embeddings | **< $5** | 12.5k × ~100 tokens on `gemini-embedding-001` |
-| Answers | **~$1** (was ~$280) | With §3.2 lazy answers |
-| Cloud SQL + GCS | **~$15 – 30/mo** | Smallest zonal instance, no HA |
-| **First sweep total** | **~$200 – $650** | |
+| Claude Opus 5 | 5.00 / 25.00 | $12.19 |
+| Claude Sonnet 5 | 3.00 / 15.00 | $7.31 |
+| Claude Haiku 4.5 | 1.00 / 5.00 | $2.44 |
+| Gemini Pro tier | ~1.25 / ~10.00 | $4.22 |
+| Gemini Flash tier | ~0.30 / ~2.50 | $1.04 |
+| MaaS open-weight × 5 | ~0.30 / ~1.00 | $2.88 |
+| **Mutate total** | | **~$30** |
 
-`runs.config` gets a `max_cost_usd` cap enforced per batch as risk §11 requires; the worker halts the batch on breach.
+| Other lines | Estimate | Notes |
+|---|---|---|
+| Referent resolution | **$20 – $140** | Now the *dominant* line. Google Search grounding runs ~$35/1k grounded requests. ~37,500 referent lookups, but `known_quantities` + Wikidata SPARQL (free) should absorb most — only the residue reaches a grounded call. The 7× spread is entirely the cache hit rate, which is why §3.6 matters |
+| Embeddings | **< $1** | 12.5k × ~50 tokens on `gemini-embedding-001` |
+| Answers (lazy, per §3.2) | **~$1** | |
+| *Answers (eager, as drawn)* | *$212* | *The single largest line in the spec's pipeline, and all of it discarded — see §3.2* |
+| **First sweep total** | **~$50 – $175** | Most likely near $80 |
+| Cloud SQL + GCS, standing | **~$25 – 40/mo** | `db-g1-small`. `db-f1-micro` (~$8/mo) is probably enough for this workload — worth trying first |
 
-**Recommendation: run a pilot sweep first** — 2 seeds × 3 models × 2 replicates × 50 gens = 600 calls, roughly $15. It exercises the entire pipeline end to end, produces the 50 hand-labelled chains calibration needs, and surfaces the Vertex quota walls before we've spent the real budget on a roster whose thresholds are still guesses.
+**Confidence.** The Claude line is solid (published per-token rates; note Vertex
+partner pricing differs from first-party and should be confirmed). The Gemini and
+MaaS per-token numbers are the shakiest input here — check them against the Vertex
+pricing page before committing, since together they are a third of the mutate cost.
+The referent-resolution range is wide because it depends on a cache hit rate we
+cannot know until the resolver runs against real chains.
 
----
+`runs.config` gets a `max_cost_usd` cap enforced per batch as risk §11 requires;
+the worker halts the batch on breach.
+
+**On phasing.** At ~$80 a sweep, cost is not a reason to pilot first. The reasons
+that survive are: the death thresholds are explicitly guesses until 50 chains are
+hand-labelled, and re-running against a corrected threshold wastes days more than
+dollars; and a pilot surfaces the Vertex per-model quota walls before they can
+strand a full sweep halfway through. A pilot of 2 seeds × 3 models × 2 replicates
+(~600 calls, ~$2) buys both. Worth doing on those grounds, not on budget grounds.
 
 ## 5. Repo layout
 
